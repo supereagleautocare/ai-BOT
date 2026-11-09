@@ -16,6 +16,7 @@ RUN set -eux; \
 COPY --chown=root:root gog-approve.mjs /usr/local/bin/gog
 RUN chmod 0755 /usr/local/bin/gog
 
+COPY --chown=root:root google-login.sh /app/google-login.sh
 COPY --chown=root:root railway-start.sh /app/railway-start.sh
 COPY --chown=root:root openclaw.seed.json /app/openclaw.seed.json
 RUN chmod 0755 /app/railway-start.sh
