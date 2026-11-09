@@ -15,6 +15,14 @@ const WAIT_MS = 10 * 60 * 1000;
 const BLOCKED = 'request blocked by --readonly';
 
 const args = process.argv.slice(2);
+
+// Outgoing mail goes out as the bot's group address (e.g. ai@...) unless --from was given.
+const DEFAULT_FROM = process.env.GOG_DEFAULT_FROM || '';
+{
+  const pos = args.filter((a) => !a.startsWith('-'));
+  const isSend = pos[0] === 'gmail' && (pos[1] === 'send' || (pos[1] === 'drafts' && pos[2] === 'create'));
+  if (DEFAULT_FROM && isSend && !args.some((a) => a === '--from' || a.startsWith('--from='))) args.push(`--from=${DEFAULT_FROM}`);
+}
 const FORBIDDEN = new Set(['auth', 'config', 'mcp', 'login', 'logout']);
 // Flags that would weaken the safety wrapper if the bot passed them itself.
 const STRIP = new Set(['--readonly', '-n', '--dry-run', '--access-token', '--enable-commands', '--disable-commands', '--enable-commands-exact', '--home', '--client']);

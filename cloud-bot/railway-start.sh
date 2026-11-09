@@ -39,5 +39,17 @@ if [ -n "${GOG_CLIENT_SECRET_JSON:-}" ]; then
   rm -f "$tmp"
 fi
 
+# Once the gateway is up, allowlist the approval-gated gog wrapper (idempotent).
+# The real binary (/opt/gog/gog) is intentionally NOT allowlisted.
+(
+  for _ in $(seq 1 60); do
+    sleep 5
+    if node /app/openclaw.mjs approvals allowlist add --gateway /usr/local/bin/gog >/dev/null 2>&1; then
+      echo "exec allowlist: /usr/local/bin/gog"
+      break
+    fi
+  done
+) &
+
 # Hand off to the image's own entrypoint so its state-repair logic still runs.
 exec node /app/docker-entrypoint.mjs node /app/openclaw.mjs gateway --bind "${OPENCLAW_GATEWAY_BIND:-lan}" --port 18789
