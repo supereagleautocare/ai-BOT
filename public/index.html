@@ -60,6 +60,17 @@
     .msg.user .meta { color: rgba(255,255,255,.75); text-align: right; }
     .typing { align-self: flex-start; color: var(--muted); font-size: 14px; padding: 4px 6px; }
 
+    #approvals { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow-y: auto;
+      background: #2a2210; border-bottom: 1px solid #5c4a1a; }
+    .appr { background: var(--panel); border: 1px solid #8a6d1f; border-radius: 14px; padding: 12px; }
+    .appr h3 { margin: 0 0 6px; font-size: 15px; color: #ffd27a; }
+    .appr pre { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace;
+      background: var(--bg); border-radius: 8px; padding: 8px; max-height: 220px; overflow: auto; }
+    .appr .cmd { color: var(--muted); font-size: 12px; }
+    .appr .row { display: flex; gap: 8px; }
+    .appr button { flex: 1; padding: 10px; border-radius: 10px; border: 0; font-weight: 700; }
+    .appr .yes { background: var(--ok); color: #062b10; }
+    .appr .no { background: #3a1d22; color: var(--err-text); border: 1px solid #6b2b35; }
     form#composer { display: flex; gap: 8px; padding: 10px 12px calc(10px + var(--safe-b)); border-top: 1px solid var(--line); background: var(--panel); }
     #input { flex: 1; resize: none; max-height: 140px; padding: 10px 14px; border-radius: 20px; border: 1px solid var(--line); background: var(--bg); outline: none; }
     #input:focus { border-color: var(--accent); }
@@ -97,6 +108,7 @@
         <button type="button" data-model="chatgpt">ChatGPT</button>
       </div>
     </div>
+    <section id="approvals" class="hidden" aria-live="assertive"></section>
     <main id="log" aria-live="polite"></main>
     <form id="composer">
       <textarea id="input" rows="1" placeholder="Message your bot…" maxlength="8000"></textarea>

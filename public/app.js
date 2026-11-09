@@ -154,6 +154,7 @@ async function poll() {
     if (s.messages.length) { renderEmpty(); updateTyping(); if (nearBottom || since === 0) scrollDown(); }
     lastState = s;
     showStatus(s);
+    if (s.pendingApprovals || !$('approvals').classList.contains('hidden')) loadApprovals();
   } catch {
     $('status').textContent = 'Connection problem…';
   }
@@ -162,6 +163,59 @@ async function poll() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('chat').classList.contains('hidden')) poll(); });
 
 function scrollDown() { $('log').scrollTop = $('log').scrollHeight; }
+
+// ---------- approvals ----------
+const shownApprovals = new Set();
+async function loadApprovals() {
+  let list;
+  try {
+    const r = await fetch('/api/approvals');
+    if (!r.ok) return;
+    list = (await r.json()).approvals.filter((a) => a.status === 'pending');
+  } catch {
+    return;
+  }
+  const box = $('approvals');
+  box.replaceChildren();
+  box.classList.toggle('hidden', list.length === 0);
+  for (const a of list) {
+    if (!shownApprovals.has(a.id)) {
+      shownApprovals.add(a.id);
+      try { navigator.vibrate?.(200); } catch {}
+    }
+    const card = document.createElement('div');
+    card.className = 'appr';
+    const h = document.createElement('h3');
+    h.textContent = `⚠️ ${a.tool}: bot wants to make a change`;
+    const pre = document.createElement('pre');
+    pre.textContent = a.summary || a.command;
+    const cmd = document.createElement('div');
+    cmd.className = 'cmd';
+    cmd.textContent = a.command;
+    const row = document.createElement('div');
+    row.className = 'row';
+    const yes = document.createElement('button');
+    yes.className = 'yes';
+    yes.textContent = 'Approve';
+    const no = document.createElement('button');
+    no.className = 'no';
+    no.textContent = 'Deny';
+    const decide = async (decision) => {
+      yes.disabled = no.disabled = true;
+      await fetch(`/api/approvals/${a.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      }).catch(() => {});
+      loadApprovals();
+    };
+    yes.addEventListener('click', () => decide('approve'));
+    no.addEventListener('click', () => decide('deny'));
+    row.append(yes, no);
+    card.append(h, pre, cmd, row);
+    box.append(card);
+  }
+}
 
 // ---------- sending ----------
 const input = $('input');

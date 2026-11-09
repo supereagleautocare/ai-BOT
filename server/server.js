@@ -21,7 +21,11 @@ const SESSION_SECRET =
   crypto.createHash('sha256').update(`session:${APP_PASSWORD}:${BRIDGE_TOKEN}`).digest('hex');
 
 if (APP_PASSWORD.length < 12 || BRIDGE_TOKEN.length < 32) {
-  console.error('Refusing to start: APP_PASSWORD (>=12 chars) and BRIDGE_TOKEN (>=32 chars) must be set.');
+  console.error(
+    APP_PASSWORD.length < 12
+      ? `Refusing to start: APP_PASSWORD is ${APP_PASSWORD.length} characters; it must be at least 12. Set a longer one in Railway Variables.`
+      : 'Refusing to start: BRIDGE_TOKEN must be at least 32 characters.'
+  );
   process.exit(1);
 }
 
@@ -30,6 +34,10 @@ const OPENCLAW_URL = (process.env.OPENCLAW_URL || '').replace(/\/+$/, '');
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
 const CLOUD_ENABLED = Boolean(OPENCLAW_URL && OPENCLAW_TOKEN);
 const CLOUD_MODEL_OVERRIDE = { free: null, chatgpt: 'openai/gpt-6-astra' };
+
+// Approvals: the cloud bot's tools ask here (private network only) before changing anything.
+const APPROVAL_TOKEN = process.env.APPROVAL_TOKEN || '';
+const APPROVAL_TTL_MS = 10 * 60 * 1000;
 
 const SESSION_DAYS = 30;
 const MAX_TEXT = 8000;
@@ -253,6 +261,35 @@ async function runCloud(m) {
   });
 }
 
+// ---------- approvals ----------
+const approvals = new Map(); // id -> {id, tool, command, summary, status, createdAt, decidedAt}
+
+function approvalView(a) {
+  const expired = a.status === 'pending' && Date.now() - a.createdAt > APPROVAL_TTL_MS;
+  return { ...a, status: expired ? 'expired' : a.status };
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  for (const [id, a] of approvals) if (a.createdAt < cutoff) approvals.delete(id);
+}, 3600 * 1000).unref();
+
+function isInternal(req) {
+  // Only reachable over Railway's private network, and only with the approval token.
+  const host = String(req.headers.host || '').split(':')[0];
+  const h = req.headers.authorization || '';
+  return (
+    APPROVAL_TOKEN.length >= 32 &&
+    host.endsWith('.railway.internal') &&
+    h.startsWith('Bearer ') &&
+    safeEqual(h.slice(7), APPROVAL_TOKEN)
+  );
+}
+
+function pendingApprovals() {
+  return [...approvals.values()].map(approvalView).filter((a) => a.status === 'pending');
+}
+
 // ---------- static files ----------
 const PUBLIC = path.join(__dirname, '..', 'public');
 const STATIC = {
@@ -273,6 +310,38 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && STATIC[p]) {
       const [file, type] = STATIC[p];
       return send(res, 200, fs.readFileSync(path.join(PUBLIC, file)), { 'Content-Type': type });
+    }
+
+    // ----- internal API for the cloud bot's tools (private network + token) -----
+    if (p.startsWith('/internal/')) {
+      if (!isInternal(req)) return send(res, 404, 'Not found');
+      if (req.method === 'POST' && p === '/internal/approvals') {
+        const body = await readJson(req);
+        if (pendingApprovals().length >= 20) return send(res, 429, { error: 'Too many pending approvals.' });
+        const a = {
+          id: crypto.randomUUID(),
+          tool: String(body.tool || 'Tool').slice(0, 40),
+          command: String(body.command || '').slice(0, 4000),
+          summary: String(body.summary || '').slice(0, 6000),
+          status: 'pending',
+          createdAt: Date.now(),
+          decidedAt: null,
+        };
+        approvals.set(a.id, a);
+        console.log(`approval requested ${a.id} (${a.tool})`);
+        return send(res, 200, { id: a.id });
+      }
+      const m = p.match(/^\/internal\/approvals\/([0-9a-f-]{36})(\/expire)?$/);
+      if (m) {
+        const a = approvals.get(m[1]);
+        if (!a) return send(res, 404, { error: 'Unknown approval.' });
+        if (req.method === 'POST' && m[2]) {
+          if (a.status === 'pending') a.status = 'expired';
+          return send(res, 200, { ok: true });
+        }
+        if (req.method === 'GET' && !m[2]) return send(res, 200, { status: approvalView(a).status });
+      }
+      return send(res, 404, 'Not found');
     }
 
     // ----- phone / browser API -----
@@ -300,6 +369,7 @@ const server = http.createServer(async (req, res) => {
         const conv = String(url.searchParams.get('conv') || '');
         return send(res, 200, {
           seq,
+          pendingApprovals: pendingApprovals().length,
           cloudEnabled: CLOUD_ENABLED,
           cloudOnline,
           bridgeOnline: Date.now() - lastBridgeSeen < BRIDGE_ONLINE_MS,
@@ -307,6 +377,25 @@ const server = http.createServer(async (req, res) => {
             .filter((m) => m.seq > since && m.conv === conv)
             .map(({ seq: s, id, role, text, model, target, status, ts }) => ({ seq: s, id, role, text, model, target, status, ts })),
         });
+      }
+
+      if (req.method === 'GET' && p === '/api/approvals') {
+        const all = [...approvals.values()].map(approvalView).sort((a, b) => b.createdAt - a.createdAt);
+        return send(res, 200, { approvals: all.slice(0, 30) });
+      }
+
+      const am = p.match(/^\/api\/approvals\/([0-9a-f-]{36})$/);
+      if (req.method === 'POST' && am) {
+        if (req.headers['content-type']?.split(';')[0] !== 'application/json') return send(res, 415, { error: 'JSON only.' });
+        const body = await readJson(req);
+        const a = approvals.get(am[1]);
+        if (!a) return send(res, 404, { error: 'Unknown approval.' });
+        if (approvalView(a).status !== 'pending') return send(res, 409, { error: `Already ${approvalView(a).status}.` });
+        if (body.decision !== 'approve' && body.decision !== 'deny') return send(res, 400, { error: 'Bad decision.' });
+        a.status = body.decision === 'approve' ? 'approved' : 'denied';
+        a.decidedAt = Date.now();
+        console.log(`approval ${a.id} ${a.status}`);
+        return send(res, 200, { ok: true, status: a.status });
       }
 
       if (req.method === 'POST' && p === '/api/send') {

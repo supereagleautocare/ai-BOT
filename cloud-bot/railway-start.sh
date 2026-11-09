@@ -28,5 +28,16 @@ if [ ! -f "$STATE/openclaw.json" ]; then
   chmod 600 "$STATE/openclaw.json"
 fi
 
+# Google Workspace CLI: store the OAuth client once (from a Railway variable), file keyring.
+if [ -n "${GOG_CLIENT_SECRET_JSON:-}" ]; then
+  mkdir -p "$GOG_HOME"
+  umask 077
+  tmp="$(mktemp)"
+  printf '%s' "$GOG_CLIENT_SECRET_JSON" > "$tmp"
+  /opt/gog/gog --no-input auth keyring file >/dev/null 2>&1 || true
+  /opt/gog/gog --no-input auth credentials "$tmp" >/dev/null 2>&1 && echo "gog: OAuth client stored" || echo "gog: could not store OAuth client" >&2
+  rm -f "$tmp"
+fi
+
 # Hand off to the image's own entrypoint so its state-repair logic still runs.
 exec node /app/docker-entrypoint.mjs node /app/openclaw.mjs gateway --bind "${OPENCLAW_GATEWAY_BIND:-lan}" --port 18789
