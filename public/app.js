@@ -46,14 +46,34 @@ function showChat() {
   poll();
 }
 
-// ---------- model picker ----------
+// ---------- model + target pickers ----------
+let target = store.get('target', 'cloud');
+let lastState = null;
+
 function setModel(m) {
   model = m;
   store.set('model', m);
-  document.querySelectorAll('.seg button').forEach((b) => b.classList.toggle('active', b.dataset.model === m));
+  document.querySelectorAll('#modelSeg button').forEach((b) => b.classList.toggle('active', b.dataset.model === m));
 }
-document.querySelectorAll('.seg button').forEach((b) => b.addEventListener('click', () => setModel(b.dataset.model)));
+function setTarget(t) {
+  target = t;
+  store.set('target', t);
+  document.querySelectorAll('#targetSeg button').forEach((b) => b.classList.toggle('active', b.dataset.target === t));
+  if (lastState) showStatus(lastState);
+}
+document.querySelectorAll('#modelSeg button').forEach((b) => b.addEventListener('click', () => setModel(b.dataset.model)));
+document.querySelectorAll('#targetSeg button').forEach((b) => b.addEventListener('click', () => setTarget(b.dataset.target)));
 setModel(model);
+setTarget(target);
+
+function showStatus(s) {
+  const cloud = target === 'cloud';
+  const on = cloud ? s.cloudOnline : s.bridgeOnline;
+  $('dot').classList.toggle('on', on);
+  if (cloud && !s.cloudEnabled) $('status').textContent = 'Cloud bot not set up yet';
+  else if (cloud) $('status').textContent = on ? 'Cloud bot online' : 'Cloud bot starting or down';
+  else $('status').textContent = on ? 'PC online' : 'PC offline — messages will wait';
+}
 
 // ---------- new chat ----------
 $('newBtn').addEventListener('click', () => {
@@ -104,6 +124,7 @@ function upsert(m) {
   if (m.role === 'user') {
     if (m.status === 'queued') meta += ' · waiting for PC';
     else if (m.status === 'working') meta += ' · working…';
+    meta += m.target === 'pc' ? ' · 💻' : ' · ☁️';
     if (m.model === 'chatgpt') meta += ' · ChatGPT';
   } else if (m.model) meta += ` · ${m.model.split('/').pop()}`;
   el.querySelector('.meta').textContent = meta;
@@ -131,8 +152,8 @@ async function poll() {
     const nearBottom = $('log').scrollHeight - $('log').scrollTop - $('log').clientHeight < 120;
     for (const m of s.messages) { upsert(m); since = Math.max(since, m.seq); }
     if (s.messages.length) { renderEmpty(); updateTyping(); if (nearBottom || since === 0) scrollDown(); }
-    $('dot').classList.toggle('on', s.bridgeOnline);
-    $('status').textContent = s.bridgeOnline ? 'PC online' : 'PC offline — messages will wait';
+    lastState = s;
+    showStatus(s);
   } catch {
     $('status').textContent = 'Connection problem…';
   }
@@ -158,7 +179,7 @@ $('composer').addEventListener('submit', async (e) => {
     const r = await fetch('/api/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, model, conv }),
+      body: JSON.stringify({ text, model, target, conv }),
     });
     if (r.status === 401) return showLogin();
     const j = await r.json();

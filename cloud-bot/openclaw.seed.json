@@ -1,0 +1,30 @@
+{
+  "gateway": {
+    "mode": "local",
+    "port": 18789,
+    "bind": "lan",
+    "auth": { "mode": "token" },
+    "http": {
+      "endpoints": {
+        "chatCompletions": { "enabled": true }
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallbacks": ["nvidia/nemotron-3.5-lightning-30b-a3b", "google/gemini-2.5-flash"]
+      },
+      "models": {
+        "nvidia/nemotron-3-ultra-550b-a55b": { "alias": "free" },
+        "nvidia/nemotron-3.5-lightning-30b-a3b": {},
+        "google/gemini-2.5-flash": {},
+        "openai/gpt-6-astra": { "alias": "chatgpt" }
+      }
+    }
+  },
+  "tools": {
+    "exec": { "security": "allowlist", "ask": "on-miss" }
+  }
+}

@@ -25,12 +25,19 @@ if (APP_PASSWORD.length < 12 || BRIDGE_TOKEN.length < 32) {
   process.exit(1);
 }
 
+// Cloud bot (OpenClaw gateway on Railway's private network). Optional.
+const OPENCLAW_URL = (process.env.OPENCLAW_URL || '').replace(/\/+$/, '');
+const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || '';
+const CLOUD_ENABLED = Boolean(OPENCLAW_URL && OPENCLAW_TOKEN);
+const CLOUD_MODEL_OVERRIDE = { free: null, chatgpt: 'openai/gpt-6-astra' };
+
 const SESSION_DAYS = 30;
 const MAX_TEXT = 8000;
 const MAX_MESSAGES = 500;
 const JOB_TIMEOUT_MS = 12 * 60 * 1000;
 const BRIDGE_ONLINE_MS = 75 * 1000;
 const MODELS = new Set(['free', 'chatgpt']);
+const TARGETS = new Set(['cloud', 'pc']);
 
 // ---------- state (in memory) ----------
 let seq = 0;
@@ -198,6 +205,54 @@ setInterval(() => {
   }
 }, 30 * 1000).unref();
 
+// ---------- cloud bot ----------
+let cloudOnline = false;
+async function checkCloud() {
+  if (!CLOUD_ENABLED) return;
+  try {
+    const r = await fetch(`${OPENCLAW_URL}/healthz`, { signal: AbortSignal.timeout(5000) });
+    cloudOnline = r.ok;
+  } catch {
+    cloudOnline = false;
+  }
+}
+checkCloud();
+setInterval(checkCloud, 30 * 1000).unref();
+
+async function runCloud(m) {
+  m.status = 'working';
+  m.startedAt = Date.now();
+  touch(m);
+  const headers = { Authorization: `Bearer ${OPENCLAW_TOKEN}`, 'Content-Type': 'application/json' };
+  const override = CLOUD_MODEL_OVERRIDE[m.model];
+  if (override) headers['x-openclaw-model'] = override;
+  let reply;
+  try {
+    const r = await fetch(`${OPENCLAW_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: 'openclaw:main', user: `phone:${m.conv}`, messages: [{ role: 'user', content: m.text }] }),
+      signal: AbortSignal.timeout(JOB_TIMEOUT_MS - 60 * 1000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) reply = { error: `Cloud bot error (${r.status}): ${j.error?.message || j.error || 'unknown'}` };
+    else reply = { text: j.choices?.[0]?.message?.content || '(no text reply)', modelUsed: j.model || '' };
+  } catch (e) {
+    reply = { error: `Cloud bot unreachable: ${e.name === 'TimeoutError' ? 'timed out' : e.message}` };
+  }
+  if (m.status !== 'working') return; // already timed out
+  m.status = 'done';
+  touch(m);
+  addMessage({
+    id: crypto.randomUUID(),
+    conv: m.conv,
+    role: reply.error ? 'error' : 'assistant',
+    text: String(reply.error || reply.text).slice(0, 100000),
+    model: String(reply.modelUsed || '').slice(0, 120),
+    replyTo: m.id,
+  });
+}
+
 // ---------- static files ----------
 const PUBLIC = path.join(__dirname, '..', 'public');
 const STATIC = {
@@ -245,10 +300,12 @@ const server = http.createServer(async (req, res) => {
         const conv = String(url.searchParams.get('conv') || '');
         return send(res, 200, {
           seq,
+          cloudEnabled: CLOUD_ENABLED,
+          cloudOnline,
           bridgeOnline: Date.now() - lastBridgeSeen < BRIDGE_ONLINE_MS,
           messages: messages
             .filter((m) => m.seq > since && m.conv === conv)
-            .map(({ seq: s, id, role, text, model, status, ts }) => ({ seq: s, id, role, text, model, status, ts })),
+            .map(({ seq: s, id, role, text, model, target, status, ts }) => ({ seq: s, id, role, text, model, target, status, ts })),
         });
       }
 
@@ -257,13 +314,18 @@ const server = http.createServer(async (req, res) => {
         const body = await readJson(req);
         const text = String(body.text || '').trim();
         const model = MODELS.has(body.model) ? body.model : 'free';
+        const target = TARGETS.has(body.target) ? body.target : CLOUD_ENABLED ? 'cloud' : 'pc';
         const conv = String(body.conv || '');
         if (!/^[a-f0-9]{16}$/.test(conv)) return send(res, 400, { error: 'Bad conversation id.' });
         if (!text) return send(res, 400, { error: 'Empty message.' });
         if (text.length > MAX_TEXT) return send(res, 400, { error: `Keep messages under ${MAX_TEXT} characters.` });
-        const m = addMessage({ id: crypto.randomUUID(), conv, role: 'user', text, model, status: 'queued' });
-        queue.push(m.id);
-        wakeBridge();
+        if (target === 'cloud' && !CLOUD_ENABLED) return send(res, 400, { error: 'Cloud bot is not set up.' });
+        const m = addMessage({ id: crypto.randomUUID(), conv, role: 'user', text, model, target, status: 'queued' });
+        if (target === 'cloud') runCloud(m);
+        else {
+          queue.push(m.id);
+          wakeBridge();
+        }
         return send(res, 200, { ok: true, id: m.id });
       }
 
