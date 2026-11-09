@@ -11,7 +11,7 @@ RUN set -eux; \
     cd /tmp; \
     node -e "fetch('https://github.com/openclaw/gogcli/releases/download/v${GOG_VERSION}/gogcli_${GOG_VERSION}_linux_amd64.tar.gz').then(r=>{if(!r.ok)throw new Error(r.status);return r.arrayBuffer()}).then(b=>require('fs').writeFileSync('gog.tgz',Buffer.from(b)))"; \
     echo "${GOG_SHA256}  gog.tgz" | sha256sum -c -; \
-    mkdir -p /opt/gog; tar -xzf gog.tgz -C /opt/gog gog; rm gog.tgz; \
+    mkdir -p /opt/gog; tar -xzf gog.tgz -C /opt/gog ./gog; rm gog.tgz; \
     chmod 0755 /opt/gog/gog; /opt/gog/gog --version
 COPY --chown=root:root gog-approve.mjs /usr/local/bin/gog
 RUN chmod 0755 /usr/local/bin/gog
