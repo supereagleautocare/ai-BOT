@@ -1,0 +1,323 @@
+// Private chat relay for the OpenClaw bot on the shop PC.
+//
+// Phone  --(password login)-->  this server  <--(bridge token, outbound only)--  PC bridge  -->  OpenClaw
+//
+// The PC is never reachable from the internet: the bridge on the PC polls this
+// server for queued messages and posts the bot's replies back.
+// No database access, no third-party dependencies. Messages live in memory only.
+
+'use strict';
+
+const http = require('node:http');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const PORT = Number(process.env.PORT) || 3000;
+const APP_PASSWORD = process.env.APP_PASSWORD || '';
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  crypto.createHash('sha256').update(`session:${APP_PASSWORD}:${BRIDGE_TOKEN}`).digest('hex');
+
+if (APP_PASSWORD.length < 12 || BRIDGE_TOKEN.length < 32) {
+  console.error('Refusing to start: APP_PASSWORD (>=12 chars) and BRIDGE_TOKEN (>=32 chars) must be set.');
+  process.exit(1);
+}
+
+const SESSION_DAYS = 30;
+const MAX_TEXT = 8000;
+const MAX_MESSAGES = 500;
+const JOB_TIMEOUT_MS = 12 * 60 * 1000;
+const BRIDGE_ONLINE_MS = 75 * 1000;
+const MODELS = new Set(['free', 'chatgpt']);
+
+// ---------- state (in memory) ----------
+let seq = 0;
+const messages = []; // {seq, id, conv, role, text, model, status, ts}
+const queue = []; // ids of user messages waiting for the bridge
+let lastBridgeSeen = 0;
+let bridgeWaiters = []; // pending long-poll responses from the bridge
+
+function nextSeq() {
+  return ++seq;
+}
+
+function addMessage(m) {
+  m.seq = nextSeq();
+  m.ts = Date.now();
+  messages.push(m);
+  while (messages.length > MAX_MESSAGES) messages.shift();
+  return m;
+}
+
+function findMessage(id) {
+  return messages.find((m) => m.id === id);
+}
+
+function touch(m) {
+  m.seq = nextSeq();
+}
+
+// ---------- helpers ----------
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function sign(value) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('base64url');
+}
+
+function makeSessionCookie() {
+  const exp = Date.now() + SESSION_DAYS * 86400 * 1000;
+  const val = `${exp}.${sign(String(exp))}`;
+  return `s=${val}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}`;
+}
+
+function isAuthed(req) {
+  const cookie = req.headers.cookie || '';
+  const m = cookie.match(/(?:^|;\s*)s=([^;]+)/);
+  if (!m) return false;
+  const [exp, mac] = m[1].split('.');
+  if (!exp || !mac || Number(exp) < Date.now()) return false;
+  return safeEqual(mac, sign(exp));
+}
+
+function isBridge(req) {
+  const h = req.headers.authorization || '';
+  return h.startsWith('Bearer ') && safeEqual(h.slice(7), BRIDGE_TOKEN);
+}
+
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Strict-Transport-Security': 'max-age=31536000',
+  'Content-Security-Policy':
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+};
+
+function send(res, status, body, headers = {}) {
+  const isJson = typeof body !== 'string' && !Buffer.isBuffer(body);
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    'Cache-Control': 'no-store',
+    'Content-Type': isJson ? 'application/json; charset=utf-8' : headers['Content-Type'] || 'text/plain; charset=utf-8',
+    ...headers,
+  });
+  res.end(isJson ? JSON.stringify(body) : body);
+}
+
+function readJson(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new Error('too large'));
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {});
+      } catch {
+        reject(new Error('bad json'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+// Login rate limiting: 8 failed attempts per IP and 40 overall per 15 minutes.
+// The overall cap still holds if someone spoofs forwarding headers.
+const loginFails = new Map();
+const WINDOW = 15 * 60 * 1000;
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+  // Rightmost entry is the one appended by Railway's proxy.
+  return xff[xff.length - 1] || req.socket.remoteAddress || 'unknown';
+}
+function failCount(key) {
+  const r = loginFails.get(key);
+  if (!r) return 0;
+  if (Date.now() - r.first > WINDOW) {
+    loginFails.delete(key);
+    return 0;
+  }
+  return r.count;
+}
+function loginBlocked(ip) {
+  return failCount(ip) >= 8 || failCount('*') >= 40;
+}
+function noteLoginFail(ip) {
+  for (const key of [ip, '*']) {
+    if (failCount(key) === 0) loginFails.set(key, { first: Date.now(), count: 1 });
+    else loginFails.get(key).count++;
+  }
+}
+
+// ---------- bridge queue ----------
+function takeJob() {
+  while (queue.length) {
+    const id = queue.shift();
+    const m = findMessage(id);
+    if (m && m.status === 'queued') {
+      m.status = 'working';
+      m.startedAt = Date.now();
+      touch(m);
+      return { id: m.id, conv: m.conv, text: m.text, model: m.model };
+    }
+  }
+  return null;
+}
+
+function wakeBridge() {
+  const waiters = bridgeWaiters;
+  bridgeWaiters = [];
+  for (const w of waiters) {
+    const job = takeJob();
+    clearTimeout(w.timer);
+    if (job) send(w.res, 200, job);
+    else send(w.res, 204, '');
+  }
+}
+
+// Fail jobs the bridge never answered (e.g. PC went to sleep mid-task).
+setInterval(() => {
+  const now = Date.now();
+  for (const m of messages) {
+    if (m.role === 'user' && m.status === 'working' && now - m.startedAt > JOB_TIMEOUT_MS) {
+      m.status = 'done';
+      touch(m);
+      addMessage({ id: crypto.randomUUID(), conv: m.conv, role: 'error', text: 'No reply from the PC in time. Try again.', replyTo: m.id });
+    }
+  }
+}, 30 * 1000).unref();
+
+// ---------- static files ----------
+const PUBLIC = path.join(__dirname, '..', 'public');
+const STATIC = {
+  '/': ['index.html', 'text/html; charset=utf-8'],
+  '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
+  '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
+  '/icon.svg': ['icon.svg', 'image/svg+xml'],
+};
+
+// ---------- routes ----------
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const p = url.pathname;
+
+  try {
+    if (req.method === 'GET' && p === '/healthz') return send(res, 200, { ok: true });
+
+    if (req.method === 'GET' && STATIC[p]) {
+      const [file, type] = STATIC[p];
+      return send(res, 200, fs.readFileSync(path.join(PUBLIC, file)), { 'Content-Type': type });
+    }
+
+    // ----- phone / browser API -----
+    if (req.method === 'POST' && p === '/api/login') {
+      const ip = clientIp(req);
+      if (loginBlocked(ip)) return send(res, 429, { error: 'Too many attempts. Wait 15 minutes.' });
+      const body = await readJson(req);
+      if (!safeEqual(body.password || '', APP_PASSWORD)) {
+        noteLoginFail(ip);
+        return send(res, 401, { error: 'Wrong password.' });
+      }
+      loginFails.delete(ip);
+      return send(res, 200, { ok: true }, { 'Set-Cookie': makeSessionCookie() });
+    }
+
+    if (req.method === 'POST' && p === '/api/logout') {
+      return send(res, 200, { ok: true }, { 'Set-Cookie': 's=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' });
+    }
+
+    if (p.startsWith('/api/')) {
+      if (!isAuthed(req)) return send(res, 401, { error: 'Not logged in.' });
+
+      if (req.method === 'GET' && p === '/api/state') {
+        const since = Number(url.searchParams.get('since')) || 0;
+        const conv = String(url.searchParams.get('conv') || '');
+        return send(res, 200, {
+          seq,
+          bridgeOnline: Date.now() - lastBridgeSeen < BRIDGE_ONLINE_MS,
+          messages: messages
+            .filter((m) => m.seq > since && m.conv === conv)
+            .map(({ seq: s, id, role, text, model, status, ts }) => ({ seq: s, id, role, text, model, status, ts })),
+        });
+      }
+
+      if (req.method === 'POST' && p === '/api/send') {
+        if (req.headers['content-type']?.split(';')[0] !== 'application/json') return send(res, 415, { error: 'JSON only.' });
+        const body = await readJson(req);
+        const text = String(body.text || '').trim();
+        const model = MODELS.has(body.model) ? body.model : 'free';
+        const conv = String(body.conv || '');
+        if (!/^[a-f0-9]{16}$/.test(conv)) return send(res, 400, { error: 'Bad conversation id.' });
+        if (!text) return send(res, 400, { error: 'Empty message.' });
+        if (text.length > MAX_TEXT) return send(res, 400, { error: `Keep messages under ${MAX_TEXT} characters.` });
+        const m = addMessage({ id: crypto.randomUUID(), conv, role: 'user', text, model, status: 'queued' });
+        queue.push(m.id);
+        wakeBridge();
+        return send(res, 200, { ok: true, id: m.id });
+      }
+
+      return send(res, 404, { error: 'Not found.' });
+    }
+
+    // ----- PC bridge API (bearer token) -----
+    if (p.startsWith('/bridge/')) {
+      if (!isBridge(req)) return send(res, 401, { error: 'Bad bridge token.' });
+      lastBridgeSeen = Date.now();
+
+      if (req.method === 'GET' && p === '/bridge/next') {
+        const job = takeJob();
+        if (job) return send(res, 200, job);
+        // Long-poll up to 25s so replies feel instant without hammering the server.
+        const waiter = { res };
+        waiter.timer = setTimeout(() => {
+          bridgeWaiters = bridgeWaiters.filter((w) => w !== waiter);
+          send(res, 204, '');
+        }, 25 * 1000);
+        req.on('close', () => {
+          clearTimeout(waiter.timer);
+          bridgeWaiters = bridgeWaiters.filter((w) => w !== waiter);
+        });
+        bridgeWaiters.push(waiter);
+        return;
+      }
+
+      if (req.method === 'POST' && p === '/bridge/reply') {
+        const body = await readJson(req, 512 * 1024);
+        const m = findMessage(String(body.id || ''));
+        if (!m || m.role !== 'user') return send(res, 404, { error: 'Unknown message.' });
+        m.status = 'done';
+        touch(m);
+        const isErr = Boolean(body.error);
+        addMessage({
+          id: crypto.randomUUID(),
+          conv: m.conv,
+          role: isErr ? 'error' : 'assistant',
+          text: String(isErr ? body.error : body.text || '(empty reply)').slice(0, 100000),
+          model: String(body.modelUsed || '').slice(0, 120),
+          replyTo: m.id,
+        });
+        return send(res, 200, { ok: true });
+      }
+
+      return send(res, 404, { error: 'Not found.' });
+    }
+
+    return send(res, 404, 'Not found');
+  } catch (err) {
+    console.error('request error', p, err.message);
+    if (!res.headersSent) send(res, 400, { error: 'Bad request.' });
+  }
+});
+
+server.listen(PORT, () => console.log(`ai-BOT relay listening on :${PORT}`));

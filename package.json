@@ -1,0 +1,14 @@
+{
+  "name": "ai-bot-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Private phone chat relay for the OpenClaw bot running on the shop PC.",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "bridge": "node bridge/bridge.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
