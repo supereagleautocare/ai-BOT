@@ -4,6 +4,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 here = fso.GetParentFolderName(WScript.ScriptFullName)
 Set sh = CreateObject("WScript.Shell")
 Do
-  sh.Run """C:\Program Files\nodejs\node.exe"" """ & here & "\bridge.js""", 0, True
+  code = sh.Run("""C:\Program Files\nodejs\node.exe"" """ & here & "\bridge.js""", 0, True)
+  If code = 3 Then WScript.Quit ' another copy is already running
   WScript.Sleep 10000
 Loop

@@ -72,8 +72,23 @@ function runAgent(job) {
   });
 }
 
+// ---------- single instance ----------
+// Holding a local-only port acts as a lock. A second copy exits with code 3,
+// which tells start-bridge.vbs to stop instead of restarting it.
+function acquireLock() {
+  return new Promise((resolve) => {
+    const srv = require('node:net').createServer();
+    srv.once('error', () => resolve(false));
+    srv.listen(47811, '127.0.0.1', () => resolve(true));
+  });
+}
+
 // ---------- relay loop ----------
 async function main() {
+  if (!(await acquireLock())) {
+    console.error('Another bridge is already running; exiting.');
+    process.exit(3);
+  }
   log(`bridge started → ${RELAY_URL}`);
   let backoff = 2000;
   for (;;) {
